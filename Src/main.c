@@ -29,20 +29,23 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include "hw_esc_telem.h"
+//#include "hw_esc_telem.h"
 
 #include "canard.h"
 #include "canard_stm32.h"
-#include "uavcan.equipment.esc.Status.h"
+//#include "uavcan.equipment.esc.Status.h"
 #include "uavcan.protocol.NodeStatus.h"
 #include "uavcan.protocol.GetNodeInfo_res.h"
+#include "uavcan.protocol.GetNodeInfo_req.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 #define DELAY1000 1000
 
-#define CANARD_MEM_POOL_SIZE 2048
+#define DRONECAN_NODE_ID                 125U
+#define CANARD_MEMORY_POOL_SIZE          4096U
+#define NODE_STATUS_PERIOD_MS            1000U
 
 /* USER CODE END PTD */
 
@@ -53,17 +56,15 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-uint8_t node_status_transfer_id = 0;
-uint8_t canard_memory_pool[CANARD_MEM_POOL_SIZE];
-CanardInstance canard;
 
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
-uint32_t T;
+CanardInstance canard;
+uint8_t memory_pool_canard[CANARD_MEMORY_POOL_SIZE];
+uint8_t node_status_transfer_id = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -74,17 +75,20 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void sendStatus(void);
 
-void droneCAN_Init(void);
-void sendNodeStatus(void);
+void blink(void);
+uint64_t micros64(void);
+void canFilter(void);
+void canard_Init(void);
 
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan);
 bool shouldAcceptTransfer(const CanardInstance *ins,
 		uint64_t *out_data_type_signature, uint16_t data_type_id,
 		CanardTransferType transfer_type, uint8_t source_node_id);
 void onTransferReceived(CanardInstance *ins, CanardRxTransfer *transfer);
-void usleep(uint32_t us);
-void sendGetNodeInfoResponse(CanardRxTransfer *transfer);
+
+void send_heartbeat(void);
+void transferCanard(void);
 /* USER CODE END 0 */
 
 /**
@@ -124,8 +128,8 @@ int main(void) {
 	MX_USART6_UART_Init();
 	MX_CAN1_Init();
 	/* USER CODE BEGIN 2 */
-	T = HAL_GetTick();
-
+	canard_Init();
+	canFilter();
 	if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING)
 			!= HAL_OK) {
 		Error_Handler();
@@ -133,8 +137,8 @@ int main(void) {
 	if (HAL_CAN_Start(&hcan1) != HAL_OK) {
 		Error_Handler();
 	}
-	droneCAN_Init();
 
+	uint32_t last_heartbeat_ms = HAL_GetTick();
 	/* USER CODE END 2 */
 
 	/* Infinite loop */
@@ -143,18 +147,16 @@ int main(void) {
 		/* USER CODE END WHILE */
 
 		/* USER CODE BEGIN 3 */
-		sendStatus();
-		// ПЕРЕДАЧА: Беремо кадри з черги Canard і відправляємо в залізо STM32
-		const CanardCANFrame *tx_frame = canardPeekTxQueue(&canard);
-		while (tx_frame != NULL) {
-			int16_t res = canardSTM32Transmit(tx_frame);
-			if (res > 0) {
-				canardPopTxQueue(&canard); // Видаляємо, якщо відправлено успішно
-			} else {
-				break; // Якщо поштові скриньки STM32 повні
-			}
-			tx_frame = canardPeekTxQueue(&canard);
+		// Відправляємо Heartbeat кожну секунду
+		if (HAL_GetTick() - last_heartbeat_ms >= 1000) {
+			last_heartbeat_ms = HAL_GetTick();
+
+			send_heartbeat();
+
 		}
+
+		transferCanard();
+
 	}
 	/* USER CODE END 3 */
 }
@@ -209,120 +211,164 @@ void SystemClock_Config(void) {
 }
 
 /* USER CODE BEGIN 4 */
-void sendStatus(void) {
-	if (HAL_GetTick() - T >= DELAY1000) {
-		T = HAL_GetTick();
-		sendNodeStatus();
-	}
+
+void blink(void) {
+	GPIOB->BSRR = (GPIOB->ODR & LED_Pin) ? (LED_Pin << 16) : LED_Pin;
+}
+uint64_t micros64(void) {
+	return (uint64_t) HAL_GetTick() * NODE_STATUS_PERIOD_MS;
 }
 
-void droneCAN_Init(void) {
-	// 2. ІНІЦІАЛІЗАЦІЯ DRONECAN
-	canardInit(&canard, canard_memory_pool, sizeof(canard_memory_pool),
-			onTransferReceived, shouldAcceptTransfer, NULL);
-	// Ініціалізація драйвера (без фільтрів - приймаємо все для тесту)
-	canardSTM32Init(NULL, 0);
+void canFilter(void) {
+	CAN_FilterTypeDef canFilterConfig;
+	canFilterConfig.FilterBank = 0;                // Номер банку фільтра
+	canFilterConfig.FilterMode = CAN_FILTERMODE_IDMASK; // Режим маски
+	canFilterConfig.FilterScale = CAN_FILTERSCALE_32BIT; // 32-бітний фільтр
+	canFilterConfig.FilterIdHigh = 0x0000;        // ID = 0
+	canFilterConfig.FilterIdLow = 0x0000;
+	canFilterConfig.FilterMaskIdHigh = 0x0000;    // Маска = 0 → пропускає все
+	canFilterConfig.FilterMaskIdLow = 0x0000;
+	canFilterConfig.FilterFIFOAssignment = CAN_FILTER_FIFO0; // В який FIFO
+	canFilterConfig.FilterActivation = ENABLE;    // Активувати
+	canFilterConfig.SlaveStartFilterBank = 14;    // Для двох CAN (F4/F7)
 
-	// Встановлення Node ID (обов'язково!)
-	canardSetLocalNodeID(&canard, 42);
+	HAL_CAN_ConfigFilter(&hcan1, &canFilterConfig);
+}
+void canard_Init(void) {
+	canardInit(&canard, memory_pool_canard, CANARD_MEMORY_POOL_SIZE,
+			onTransferReceived, shouldAcceptTransfer, NULL);
+	canardSetLocalNodeID(&canard, DRONECAN_NODE_ID);
+}
+
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
+	blink();
+	CAN_RxHeaderTypeDef rx_header;
+	uint8_t data[8];
+	// Вичитуємо всі повідомлення, поки FIFO не стане порожнім
+	while (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0) > 0) {
+		if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, data)
+				== HAL_OK) {
+			CanardCANFrame frame;
+			frame.id = rx_header.ExtId | CANARD_CAN_FRAME_EFF;
+			frame.data_len = rx_header.DLC;
+			memcpy(frame.data, data, 8);
+			// Передаємо кадр у libcanard
+			canardHandleRxFrame(&canard, &frame, micros64());
+		}
+	}
 }
 
 bool shouldAcceptTransfer(const CanardInstance *ins,
 		uint64_t *out_data_type_signature, uint16_t data_type_id,
 		CanardTransferType transfer_type, uint8_t source_node_id) {
-	// 1. Приймаємо запит на інформацію про вузол (GetNodeInfo)
-	// Це критично для відображення в Mission Planner
-	if (data_type_id == UAVCAN_PROTOCOL_GETNODEINFO_RESPONSE_ID) {
+	(void) ins;
+	(void) source_node_id; // Ігноруємо невикористані параметри
+
+	// Наприклад, ми хочемо приймати повідомлення "NodeStatus" від інших вузлів
+	// ID типів даних зазвичай беруться з ваших згенерованих DSDL заголовків
+	if (data_type_id == UAVCAN_PROTOCOL_NODESTATUS_ID) {
+		// Також потрібно вказати сигнатуру типу (вона є у згенерованих DSDL файлах)
+		*out_data_type_signature = UAVCAN_PROTOCOL_NODESTATUS_SIGNATURE;
+		return true;
+	}
+	if (data_type_id == UAVCAN_PROTOCOL_GETNODEINFO_REQUEST_ID) {
 		*out_data_type_signature =
-		UAVCAN_PROTOCOL_GETNODEINFO_RESPONSE_SIGNATURE;
+				UAVCAN_PROTOCOL_GETNODEINFO_REQUEST_SIGNATURE;
 		return true;
 	}
 
-	// 2. Якщо ви хочете приймати команди керування ESC (RawCommand)
-	/*
-	 if (data_type_id == UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID)
-	 {
-	 *out_data_type_signature = UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_SIGNATURE;
-	 return true;
-	 }
-	 */
-
-	return false; // Решту повідомлень ігноруємо
+	return false; // Все інше ігноруємо
 }
 
 void onTransferReceived(CanardInstance *ins, CanardRxTransfer *transfer) {
-	// Перевіряємо, чи це запит на GetNodeInfo
-	if (transfer->data_type_id == UAVCAN_PROTOCOL_GETNODEINFO_RESPONSE_ID) {
-		sendGetNodeInfoResponse(transfer); // Функція-відповідь (див. нижче)
-	}
-
-	// Обробка вхідних статусів інших ESC, якщо потрібно
-	if (transfer->data_type_id == UAVCAN_EQUIPMENT_ESC_STATUS_ID) {
-		struct uavcan_equipment_esc_Status esc_msg;
-		// Використовуємо згенеровану функцію декодування [2]
-		if (_uavcan_equipment_esc_Status_decode(transfer, &esc_msg) == 0) {
-			// Логіка обробки отриманих даних ESC
+	// 1. Обробка повідомлення NodeStatus (Heartbeat від інших вузлів)
+	if (transfer->data_type_id == UAVCAN_PROTOCOL_NODESTATUS_ID) {
+		struct uavcan_protocol_NodeStatus msg;
+		if (uavcan_protocol_NodeStatus_decode(transfer, &msg) >= 0) {
+			// Тут можна обробляти статус інших вузлів
 		}
 	}
+	// 2. Обробка запиту GetNodeInfo (Сервісний запит від польотного контролера)
+	if (transfer->data_type_id == UAVCAN_PROTOCOL_GETNODEINFO_RESPONSE_ID) {
+		struct uavcan_protocol_GetNodeInfoResponse res;
+		memset(&res, 0, sizeof(res));
+
+		// Заповнюємо дані про статус (як у вашому Heartbeat)
+		res.status.uptime_sec = HAL_GetTick() / 1000;
+		res.status.health = UAVCAN_PROTOCOL_NODESTATUS_HEALTH_OK;
+		res.status.mode = UAVCAN_PROTOCOL_NODESTATUS_MODE_OPERATIONAL;
+
+		// Версії ПЗ та апаратного забезпечення
+		res.software_version.major = 1;
+		res.software_version.minor = 0;
+		res.hardware_version.major = 1;
+		res.hardware_version.minor = 0;
+
+		// Ім'я вашого пристрою (максимум 80 символів)
+		const char *name = "dronecan";
+		res.name.len = strlen(name);
+		memcpy(res.name.data, name, res.name.len);
+
+		// Кодуємо відповідь у буфер
+		uint8_t buffer[UAVCAN_PROTOCOL_GETNODEINFO_RESPONSE_MAX_SIZE];
+		uint16_t total_size = uavcan_protocol_GetNodeInfoResponse_encode(&res,
+				buffer);
+
+		// ВІДПРАВЛЯЄМО ВІДПОВІДЬ
+		// Важливо: використовуємо transfer_id та source_node_id з отриманого запиту!
+		canardRequestOrRespond(ins, transfer->source_node_id, // 2. Кому (ID запитувача)
+				UAVCAN_PROTOCOL_GETNODEINFO_RESPONSE_SIGNATURE,  // 3. Сигнатура
+				UAVCAN_PROTOCOL_GETNODEINFO_RESPONSE_ID,        // 4. ID сервісу
+				&transfer->transfer_id,             // 5. АДРЕСА (&) transfer_id
+				transfer->priority,                     		// 6. Пріоритет
+				CanardTransferTypeResponse,             // 7. Тип (відповідь)
+				buffer,                                 			// 8. Дані
+				total_size);                            		// 9. Довжина
+	}
+
 }
 
-void sendNodeStatus(void) {
+void send_heartbeat(void) {
 	struct uavcan_protocol_NodeStatus msg;
-	// 1. Заповнюємо поля структури
-	msg.uptime_sec = HAL_GetTick() / 1000; 		// Час роботи вузла в секундах
-	msg.health = UAVCAN_PROTOCOL_NODESTATUS_HEALTH_OK; // Стан (OK, WARNING, ERROR, CRITICAL)
-	msg.mode = UAVCAN_PROTOCOL_NODESTATUS_MODE_OPERATIONAL; // Режим роботи
+	uint8_t buffer[UAVCAN_PROTOCOL_NODESTATUS_MAX_SIZE];
+// 1. Заповнюємо структуру повідомлення даними
+	msg.uptime_sec = HAL_GetTick() / NODE_STATUS_PERIOD_MS;
+	msg.health = UAVCAN_PROTOCOL_NODESTATUS_HEALTH_OK;
+	msg.mode = UAVCAN_PROTOCOL_NODESTATUS_MODE_OPERATIONAL;
 	msg.sub_mode = 0;
 	msg.vendor_specific_status_code = 0;
-
-	// 2. Кодуємо повідомлення у буфер
-	uint8_t buffer[UAVCAN_PROTOCOL_NODESTATUS_MAX_SIZE];
-	uint16_t len = uavcan_protocol_NodeStatus_encode(&msg, buffer);
-
-	// 3. Публікуємо повідомлення (Broadcast)
-	// ID повідомлення NodeStatus — 341
-	canardBroadcast(&canard,
+// 2. Кодуємо структуру в масив байтів (використовуємо згенеровану функцію)
+	uint32_t len = uavcan_protocol_NodeStatus_encode(&msg, buffer);
+// 3. Передаємо дані в чергу libcanard для трансляції (Broadcast)
+// Використовуємо ID та Signature, які визначені у згенерованому заголовку
+	int16_t res = canardBroadcast(&canard,
 	UAVCAN_PROTOCOL_NODESTATUS_SIGNATURE,
 	UAVCAN_PROTOCOL_NODESTATUS_ID, &node_status_transfer_id,
-	CANARD_TRANSFER_PRIORITY_LOW, buffer, len);
-
+	CANARD_TRANSFER_PRIORITY_LOWEST, buffer, len);
 }
 
-void usleep(uint32_t us) {
-	/* Для частоти 180 МГц один мікросекундний цикл з NOP
-	 займає приблизно 30-45 ітерацій залежно від оптимізації */
-	uint32_t count = us * 30;
-	while (count--) {
-		__asm__ volatile ("nop");
+void transferCanard(void) {
+	const CanardCANFrame *tx_frame = canardPeekTxQueue(&canard);
+	while (tx_frame != NULL) {
+		CAN_TxHeaderTypeDef tx_header;
+		uint32_t tx_mailbox;
+
+		tx_header.ExtId = tx_frame->id & CANARD_CAN_EXT_ID_MASK;
+		tx_header.IDE = CAN_ID_EXT;
+		tx_header.RTR = CAN_RTR_DATA;
+		tx_header.DLC = tx_frame->data_len;
+
+		if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0) {
+			if (HAL_CAN_AddTxMessage(&hcan1, &tx_header,
+					(uint8_t*) tx_frame->data, &tx_mailbox) == HAL_OK) {
+				canardPopTxQueue(&canard);
+				tx_frame = canardPeekTxQueue(&canard);
+				continue;
+			}
+		}
+		break;
 	}
-}
-
-void sendGetNodeInfoResponse(CanardRxTransfer *transfer) {
-	struct uavcan_protocol_GetNodeInfoResponse resp;
-	memset(&resp, 0, sizeof(resp));
-
-	// Налаштування інформації про ваш девайс
-	resp.status.uptime_sec = HAL_GetTick() / 1000;
-	resp.status.health = UAVCAN_PROTOCOL_NODESTATUS_HEALTH_OK;
-	resp.status.mode = UAVCAN_PROTOCOL_NODESTATUS_MODE_OPERATIONAL;
-
-	resp.software_version.major = 1;
-	resp.software_version.minor = 0;
-	resp.hardware_version.major = 1;
-
-	// Назва пристрою, яку ви побачите в Mission Planner
-	const char *node_name = "fastudio4.esc_hexa";
-	memcpy(resp.name.data, node_name, strlen(node_name));
-	resp.name.len = strlen(node_name);
-
-	uint8_t buffer[UAVCAN_PROTOCOL_GETNODEINFO_RESPONSE_MAX_SIZE];
-	uint16_t len = uavcan_protocol_GetNodeInfoResponse_encode(&resp, buffer);
-
-	// Відправляємо відповідь саме тому вузлу, який запитав (source_node_id)
-	canardRequestOrRespond(&canard, transfer->source_node_id,
-	UAVCAN_PROTOCOL_GETNODEINFO_RESPONSE_SIGNATURE,
-	UAVCAN_PROTOCOL_GETNODEINFO_RESPONSE_ID, &transfer->transfer_id,
-			transfer->priority, CanardResponse, buffer, len);
+	canardCleanupStaleTransfers(&canard, micros64());
 }
 /* USER CODE END 4 */
 
