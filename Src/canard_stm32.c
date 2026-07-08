@@ -9,7 +9,7 @@
 #include "canard_stm32.h"
 #include "_internal_bxcan.h"
 #include <unistd.h>
-
+#include "stm32f4xx_hal.h"
 
 #if CANARD_STM32_USE_CAN2
 # define BXCAN                                                  CANARD_STM32_CAN2
@@ -136,7 +136,8 @@ static bool waitMSRINAKBitStateChange(volatile const CanardSTM32CANType* const b
         }
 
         // Sleep 1 millisecond
-        usleep(1000);           // TODO: This function may be missing on some platforms
+//        usleep(1000);           // TODO: This function may be missing on some platforms
+        HAL_Delay(1);
     }
 
     return false;
