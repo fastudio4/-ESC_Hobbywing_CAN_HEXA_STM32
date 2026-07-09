@@ -7,7 +7,7 @@
 #define HWESC_HEADER           0x9B
 #define HWESC_LENGTH_BYTE      0x16
 #define HWESC_FRAME_SIZE       24
-#define HWESC_COUNT 			1 // Кількість портів
+#define HWESC_COUNT 			6 // Кількість портів
 
 typedef struct {
 	uint16_t rpm;
